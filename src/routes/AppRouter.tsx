@@ -2,13 +2,27 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Login from "../pages/Login";
 import MainPage from "../pages/MainPage";
 import MLBMatchPredictor from "../pages/MainPage";
+import { RedirectToSignIn, SignedIn, SignedOut } from "@clerk/clerk-react";
 
 export default function AppRouter() {
   return (
-    <BrowserRouter>
+     <BrowserRouter>
       <Routes>
-        <Route path="/" element={<MLBMatchPredictor />} />
-        <Route path="/main" element={<MainPage />} />
+        <Route
+          path="/"
+          element={
+            <>
+              <SignedIn>
+                <MLBMatchPredictor />
+              </SignedIn>
+
+              <SignedOut>
+                <RedirectToSignIn />
+              </SignedOut>
+            </>
+          }
+        />
+
       </Routes>
     </BrowserRouter>
   );

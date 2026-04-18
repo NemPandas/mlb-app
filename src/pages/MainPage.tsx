@@ -260,23 +260,28 @@ function computeModel(
     return 0.6 * opsIdx + 0.4 * (rpg / lg.runsPerGame);
   };
 
-  const pitcherIndex = (pit: PitchingStats | null) => {
-    if (!pit) return 1.0;
-    const eraIdx = lg.era / Math.max(pit.era, 0.5);
-    const kPerBf =
-      pit.inningsPitched > 0 ? pit.strikeOuts / (pit.inningsPitched * 3) : 0.2;
-    const bbPerBf =
-      pit.inningsPitched > 0
-        ? pit.baseOnBalls / (pit.inningsPitched * 3)
-        : 0.08;
-    const kbbIdx = (kPerBf - bbPerBf + 0.12) / 0.12;
-    const whipIdx = lg.whip / Math.max(pit.whip, 0.5);
-    return (
-      0.45 * eraIdx +
-      0.3 * Math.max(0.5, Math.min(1.5, kbbIdx)) +
-      0.25 * whipIdx
-    );
-  };
+const pitcherIndex = (pit: PitchingStats | null) => {
+  if (!pit) return 1.0;
+
+  const STABILIZATION_IP = 50;
+  const weight = pit.inningsPitched / (pit.inningsPitched + STABILIZATION_IP);
+
+  const regressedEra  = weight * pit.era  + (1 - weight) * lg.era;
+  const regressedWhip = weight * pit.whip + (1 - weight) * lg.whip;
+
+  const eraIdx  = lg.era  / Math.max(regressedEra,  0.5);
+  const whipIdx = lg.whip / Math.max(regressedWhip, 0.5);
+
+  const kPerBf  = pit.inningsPitched > 0 ? pit.strikeOuts  / (pit.inningsPitched * 3) : 0.2;
+  const bbPerBf = pit.inningsPitched > 0 ? pit.baseOnBalls / (pit.inningsPitched * 3) : 0.08;
+  const kbbIdx  = (kPerBf - bbPerBf + 0.12) / 0.12;
+
+  return (
+    0.45 * eraIdx +
+    0.3  * Math.max(0.5, Math.min(1.5, kbbIdx)) +
+    0.25 * whipIdx
+  );
+};
 
   const awayOffIdx = offenseIndex(awayOff);
   const homeOffIdx = offenseIndex(homeOff);
@@ -668,7 +673,7 @@ function GameCard({
   }, [away, home, game, season, leagueAverages]);
 
   return (
-    <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+    <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
       {/* Card header */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100">
         <span className="text-xs text-gray-400">{gameTime}</span>
@@ -822,7 +827,7 @@ export default function MLBMatchPredictor() {
     "text-sm px-3 py-1.5 border border-gray-200 rounded-lg bg-white text-gray-700 hover:bg-gray-50 transition-colors";
 
   return (
-    <div className="py-4">
+    <div className="py-8 px-8 bg-neutral-100">
       <h1 className="text-xl font-medium text-gray-800 mb-5">
         MLB Meccs Predikció
       </h1>
