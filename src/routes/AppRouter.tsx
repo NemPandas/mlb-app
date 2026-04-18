@@ -1,10 +1,10 @@
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { HashRouter, Routes, Route } from "react-router-dom";
 import MLBMatchPredictor from "../pages/MainPage";
 import { RedirectToSignIn, SignedIn, SignedOut } from "@clerk/clerk-react";
 
 export default function AppRouter() {
   return (
-     <BrowserRouter>
+    <HashRouter>
       <Routes>
         <Route
           path="/"
@@ -20,8 +20,7 @@ export default function AppRouter() {
             </>
           }
         />
-
       </Routes>
-    </BrowserRouter>
+    </HashRouter>
   );
 }
