@@ -1,6 +1,4 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
-import Login from "../pages/Login";
-import MainPage from "../pages/MainPage";
 import MLBMatchPredictor from "../pages/MainPage";
 import { RedirectToSignIn, SignedIn, SignedOut } from "@clerk/clerk-react";
 
