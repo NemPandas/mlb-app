@@ -73,6 +73,24 @@ interface ModelResult {
 }
 
 // Dinamikusan lekért liganátlagok
+type ModelVariant = "basic" | "reducedPitcher";
+
+const MODEL_LABELS: Record<
+  ModelVariant,
+  { title: string; badge: string; note: string }
+> = {
+  basic: {
+    title: "MLB Meccs Predikció",
+    badge: "Basic",
+    note: "A jelenlegi alapmodell változatlan pitcher index súlyozással.",
+  },
+  reducedPitcher: {
+    title: "MLB Meccs Predikció - Reduce Pitcher",
+    badge: "Reduce Pitcher",
+    note: "Pitcher index ligaátlag felé húzva, kisebb ERA/WHIP/K-BB kilengéssel.",
+  },
+};
+
 interface LeagueAverages {
   runsPerGame: number; // átlagos futás/meccs csapatonként
   ops: number; // ligaátlag OPS
@@ -253,6 +271,7 @@ function computeModel(
   homePit: PitchingStats | null,
   game: Game,
   lg: LeagueAverages,
+  variant: ModelVariant,
 ): ModelResult {
   const offenseIndex = (off: HittingStats) => {
     const opsIdx = off.ops / lg.ops;
@@ -260,28 +279,35 @@ function computeModel(
     return 0.6 * opsIdx + 0.4 * (rpg / lg.runsPerGame);
   };
 
-const pitcherIndex = (pit: PitchingStats | null) => {
-  if (!pit) return 1.0;
+  const pitcherIndex = (pit: PitchingStats | null) => {
+    if (!pit) return 1.0;
 
-  const STABILIZATION_IP = 50;
-  const weight = pit.inningsPitched / (pit.inningsPitched + STABILIZATION_IP);
+    const reduced = variant === "reducedPitcher";
+    const STABILIZATION_IP = reduced ? 90 : 50;
+    const weight = pit.inningsPitched / (pit.inningsPitched + STABILIZATION_IP);
 
-  const regressedEra  = weight * pit.era  + (1 - weight) * lg.era;
-  const regressedWhip = weight * pit.whip + (1 - weight) * lg.whip;
+    const regressedEra = weight * pit.era + (1 - weight) * lg.era;
+    const regressedWhip = weight * pit.whip + (1 - weight) * lg.whip;
 
-  const eraIdx  = lg.era  / Math.max(regressedEra,  0.5);
-  const whipIdx = lg.whip / Math.max(regressedWhip, 0.5);
+    const eraIdx = lg.era / Math.max(regressedEra, 0.5);
+    const whipIdx = lg.whip / Math.max(regressedWhip, 0.5);
 
-  const kPerBf  = pit.inningsPitched > 0 ? pit.strikeOuts  / (pit.inningsPitched * 3) : 0.2;
-  const bbPerBf = pit.inningsPitched > 0 ? pit.baseOnBalls / (pit.inningsPitched * 3) : 0.08;
-  const kbbIdx  = (kPerBf - bbPerBf + 0.12) / 0.12;
+    const kPerBf =
+      pit.inningsPitched > 0 ? pit.strikeOuts / (pit.inningsPitched * 3) : 0.2;
+    const bbPerBf =
+      pit.inningsPitched > 0 ? pit.baseOnBalls / (pit.inningsPitched * 3) : 0.08;
+    const kbbIdx = (kPerBf - bbPerBf + 0.12) / 0.12;
 
-  return (
-    0.45 * eraIdx +
-    0.3  * Math.max(0.5, Math.min(1.5, kbbIdx)) +
-    0.25 * whipIdx
-  );
-};
+    const rawIndex =
+      0.45 * eraIdx +
+      0.3 * Math.max(0.5, Math.min(1.5, kbbIdx)) +
+      0.25 * whipIdx;
+
+    if (!reduced) return rawIndex;
+
+    const softened = 1 + (rawIndex - 1) * 0.45;
+    return Math.max(0.85, Math.min(1.15, softened));
+  };
 
   const awayOffIdx = offenseIndex(awayOff);
   const homeOffIdx = offenseIndex(homeOff);
@@ -423,10 +449,12 @@ function ResultPanel({
   result,
   game,
   averages,
+  variant,
 }: {
   result: ModelResult;
   game: Game;
   averages: LeagueAverages;
+  variant: ModelVariant;
 }) {
   const awayName = game.teams.away.team.name;
   const homeName = game.teams.home.team.name;
@@ -435,6 +463,11 @@ function ResultPanel({
 
   return (
     <div className="px-4 py-3 border-t border-gray-100 bg-gray-50">
+      <div className="mb-2">
+        <span className="rounded-md border border-gray-200 bg-white px-2 py-0.5 text-[11px] font-medium text-gray-500">
+          {MODEL_LABELS[variant].badge}
+        </span>
+      </div>
       <p className="text-[11px] font-medium tracking-wider uppercase text-gray-400 mb-3">
         Modell eredmény — Pythagorean (γ=1.83)
       </p>
@@ -577,9 +610,11 @@ function ResultPanel({
 function GameCard({
   game,
   leagueAverages,
+  variant,
 }: {
   game: Game;
   leagueAverages: LeagueAverages | null;
+  variant: ModelVariant;
 }) {
   const [calcState, setCalcState] = useState<
     "idle" | "loading" | "done" | "error"
@@ -664,13 +699,15 @@ function GameCard({
       const awayPit = awayPitData ? extractPitching(awayPitData) : null;
       const homePit = homePitData ? extractPitching(homePitData) : null;
 
-      setResult(computeModel(awayOff, homeOff, awayPit, homePit, game, lg));
+      setResult(
+        computeModel(awayOff, homeOff, awayPit, homePit, game, lg, variant),
+      );
       setCalcState("done");
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : "Ismeretlen hiba");
       setCalcState("error");
     }
-  }, [away, home, game, season, leagueAverages]);
+  }, [away, home, game, season, leagueAverages, variant]);
 
   return (
     <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
@@ -747,6 +784,7 @@ function GameCard({
           result={result}
           game={game}
           averages={leagueAverages ?? FALLBACK_AVERAGES}
+          variant={variant}
         />
       )}
     </div>
@@ -755,7 +793,11 @@ function GameCard({
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export default function MLBMatchPredictor() {
+export default function MLBMatchPredictor({
+  variant = "basic",
+}: {
+  variant?: ModelVariant;
+}) {
   const [currentDate, setCurrentDate] = useState<Date>(new Date());
   const [games, setGames] = useState<Game[]>([]);
   const [loadState, setLoadState] = useState<
@@ -825,13 +867,19 @@ export default function MLBMatchPredictor() {
 
   const navBtnClass =
     "text-sm px-3 py-1.5 border border-gray-200 rounded-lg bg-white text-gray-700 hover:bg-gray-50 transition-colors";
+  const model = MODEL_LABELS[variant];
 
   return (
     <div className="py-8 px-8 bg-neutral-100">
-      <h1 className="text-xl font-medium text-gray-800 mb-5">
-        MLB Meccs Predikció
-      </h1>
-
+      <div className="mb-5">
+        <div className="flex items-center gap-2 flex-wrap">
+          <h1 className="text-xl font-medium text-gray-800">{model.title}</h1>
+          <span className="rounded-lg border border-blue-100 bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700">
+            {model.badge}
+          </span>
+        </div>
+        <p className="mt-1 text-xs text-gray-400">{model.note}</p>
+      </div>
       {/* Date navigation */}
       <div className="flex items-center gap-2 mb-5 flex-wrap">
         <input
@@ -897,6 +945,7 @@ export default function MLBMatchPredictor() {
               key={game.gamePk}
               game={game}
               leagueAverages={leagueAverages}
+              variant={variant}
             />
           ))}
         </div>
