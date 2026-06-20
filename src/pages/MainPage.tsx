@@ -73,6 +73,22 @@ interface ModelResult {
 }
 
 // Dinamikusan lekért liganátlagok
+type BacktestStatus = "idle" | "loading" | "done" | "error";
+
+interface BacktestRow {
+  label: string;
+  picked: number;
+  won: number;
+  lost: number;
+}
+
+interface BacktestResult {
+  startDate: string;
+  endDate: string;
+  totalFinalGames: number;
+  rows: BacktestRow[];
+}
+
 type ModelVariant = "basic" | "reducedPitcher";
 
 const MODEL_LABELS: Record<
@@ -349,6 +365,42 @@ function computeModel(
 
 // ─── Date helpers ─────────────────────────────────────────────────────────────
 
+async function fetchGameModel(
+  game: Game,
+  lg: LeagueAverages,
+  variant: ModelVariant,
+): Promise<ModelResult> {
+  const season = new Date(game.gameDate).getFullYear();
+  const away = game.teams.away;
+  const home = game.teams.home;
+
+  const [awayHit, homeHit, awayPitData, homePitData] = await Promise.all([
+    mlbFetch<Record<string, unknown>>(
+      `/teams/${away.team.id}/stats?stats=season&season=${season}&group=hitting`,
+    ),
+    mlbFetch<Record<string, unknown>>(
+      `/teams/${home.team.id}/stats?stats=season&season=${season}&group=hitting`,
+    ),
+    away.probablePitcher
+      ? mlbFetch<Record<string, unknown>>(
+          `/people/${away.probablePitcher.id}/stats?stats=season&season=${season}&group=pitching`,
+        )
+      : Promise.resolve(null),
+    home.probablePitcher
+      ? mlbFetch<Record<string, unknown>>(
+          `/people/${home.probablePitcher.id}/stats?stats=season&season=${season}&group=pitching`,
+        )
+      : Promise.resolve(null),
+  ]);
+
+  const awayOff = extractHitting(awayHit);
+  const homeOff = extractHitting(homeHit);
+  const awayPit = awayPitData ? extractPitching(awayPitData) : null;
+  const homePit = homePitData ? extractPitching(homePitData) : null;
+
+  return computeModel(awayOff, homeOff, awayPit, homePit, game, lg, variant);
+}
+
 function formatDate(d: Date): string {
   return d.toISOString().split("T")[0];
 }
@@ -363,6 +415,160 @@ function displayDate(d: Date): string {
 }
 
 // ─── League averages badge ────────────────────────────────────────────────────
+
+const BACKTEST_THRESHOLD = 0.6;
+
+function createBacktestRows(): BacktestRow[] {
+  return [
+    { label: "Model win chance", picked: 0, won: 0, lost: 0 },
+    { label: "Expected runs", picked: 0, won: 0, lost: 0 },
+    { label: "Offense index", picked: 0, won: 0, lost: 0 },
+    { label: "Pitcher index", picked: 0, won: 0, lost: 0 },
+    { label: "Record index", picked: 0, won: 0, lost: 0 },
+    { label: "OPS", picked: 0, won: 0, lost: 0 },
+    { label: "ERA", picked: 0, won: 0, lost: 0 },
+    { label: "WHIP", picked: 0, won: 0, lost: 0 },
+  ];
+}
+
+function probabilityPick(
+  awayValue: number,
+  homeValue: number,
+  higherIsBetter = true,
+): { side: "away" | "home"; probability: number } | null {
+  if (!Number.isFinite(awayValue) || !Number.isFinite(homeValue)) return null;
+  if (awayValue <= 0 || homeValue <= 0) return null;
+
+  const awayScore = higherIsBetter ? awayValue : 1 / awayValue;
+  const homeScore = higherIsBetter ? homeValue : 1 / homeValue;
+  const total = awayScore + homeScore;
+  if (total <= 0) return null;
+
+  const awayProb = awayScore / total;
+  return awayProb >= 0.5
+    ? { side: "away", probability: awayProb }
+    : { side: "home", probability: 1 - awayProb };
+}
+
+function addBacktestPick(
+  row: BacktestRow,
+  pick: { side: "away" | "home"; probability: number } | null,
+  actualWinner: "away" | "home",
+) {
+  if (!pick || pick.probability < BACKTEST_THRESHOLD) return;
+  row.picked += 1;
+  if (pick.side === actualWinner) row.won += 1;
+  else row.lost += 1;
+}
+
+function addGameToBacktestRows(
+  rows: BacktestRow[],
+  game: Game,
+  result: ModelResult,
+) {
+  const awayRuns = game.linescore?.teams.away.runs;
+  const homeRuns = game.linescore?.teams.home.runs;
+  if (awayRuns === undefined || homeRuns === undefined || awayRuns === homeRuns)
+    return;
+
+  const actualWinner = awayRuns > homeRuns ? "away" : "home";
+
+  addBacktestPick(
+    rows[0],
+    result.awayWP >= result.homeWP
+      ? { side: "away", probability: result.awayWP }
+      : { side: "home", probability: result.homeWP },
+    actualWinner,
+  );
+  addBacktestPick(
+    rows[1],
+    probabilityPick(result.awayER, result.homeER),
+    actualWinner,
+  );
+  addBacktestPick(
+    rows[2],
+    probabilityPick(result.awayOffIdx, result.homeOffIdx),
+    actualWinner,
+  );
+  addBacktestPick(
+    rows[3],
+    probabilityPick(result.awayPitIdx, result.homePitIdx),
+    actualWinner,
+  );
+  addBacktestPick(
+    rows[4],
+    probabilityPick(result.awayRecordIdx, result.homeRecordIdx),
+    actualWinner,
+  );
+  addBacktestPick(
+    rows[5],
+    probabilityPick(result.awayOff.ops, result.homeOff.ops),
+    actualWinner,
+  );
+  addBacktestPick(
+    rows[6],
+    result.awayPit && result.homePit
+      ? probabilityPick(result.awayPit.era, result.homePit.era, false)
+      : null,
+    actualWinner,
+  );
+  addBacktestPick(
+    rows[7],
+    result.awayPit && result.homePit
+      ? probabilityPick(result.awayPit.whip, result.homePit.whip, false)
+      : null,
+    actualWinner,
+  );
+}
+
+export async function runSevenDayBacktest(
+  anchorDate: Date,
+  variant: ModelVariant,
+): Promise<BacktestResult> {
+  const end = new Date(anchorDate);
+  end.setDate(end.getDate() - 1);
+  const start = new Date(end);
+  start.setDate(start.getDate() - 6);
+
+  const rows = createBacktestRows();
+  const leagueCache = new Map<number, LeagueAverages>();
+  let totalFinalGames = 0;
+
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const dateStr = formatDate(d);
+    const season = d.getFullYear();
+
+    let lg = leagueCache.get(season);
+    if (!lg) {
+      lg = await fetchLeagueAverages(season);
+      leagueCache.set(season, lg);
+    }
+
+    const data = await mlbFetch<{ dates?: Array<{ games: Game[] }> }>(
+      `/schedule?sportId=1&date=${dateStr}&hydrate=team,probablePitcher,linescore`,
+    );
+    const finalGames = (data.dates?.[0]?.games ?? []).filter(
+      (game) =>
+        game.status.abstractGameState === "Final" &&
+        game.linescore?.teams.away.runs !== undefined &&
+        game.linescore?.teams.home.runs !== undefined,
+    );
+
+    totalFinalGames += finalGames.length;
+
+    for (const game of finalGames) {
+      const result = await fetchGameModel(game, lg, variant);
+      addGameToBacktestRows(rows, game, result);
+    }
+  }
+
+  return {
+    startDate: formatDate(start),
+    endDate: formatDate(end),
+    totalFinalGames,
+    rows,
+  };
+}
 
 function LeagueBadge({
   averages,
@@ -667,47 +873,19 @@ function GameCard({
   const badgeText =
     state === "Live" ? "ÉLŐ" : isFinal ? "Befejezett" : "Tervezett";
 
-  const season = new Date(game.gameDate).getFullYear();
-
   const handleCalculate = useCallback(async () => {
     setCalcState("loading");
     setErrorMsg("");
     try {
       const lg = leagueAverages ?? FALLBACK_AVERAGES;
 
-      const [awayHit, homeHit, awayPitData, homePitData] = await Promise.all([
-        mlbFetch<Record<string, unknown>>(
-          `/teams/${away.team.id}/stats?stats=season&season=${season}&group=hitting`,
-        ),
-        mlbFetch<Record<string, unknown>>(
-          `/teams/${home.team.id}/stats?stats=season&season=${season}&group=hitting`,
-        ),
-        away.probablePitcher
-          ? mlbFetch<Record<string, unknown>>(
-              `/people/${away.probablePitcher.id}/stats?stats=season&season=${season}&group=pitching`,
-            )
-          : Promise.resolve(null),
-        home.probablePitcher
-          ? mlbFetch<Record<string, unknown>>(
-              `/people/${home.probablePitcher.id}/stats?stats=season&season=${season}&group=pitching`,
-            )
-          : Promise.resolve(null),
-      ]);
-
-      const awayOff = extractHitting(awayHit);
-      const homeOff = extractHitting(homeHit);
-      const awayPit = awayPitData ? extractPitching(awayPitData) : null;
-      const homePit = homePitData ? extractPitching(homePitData) : null;
-
-      setResult(
-        computeModel(awayOff, homeOff, awayPit, homePit, game, lg, variant),
-      );
+      setResult(await fetchGameModel(game, lg, variant));
       setCalcState("done");
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : "Ismeretlen hiba");
       setCalcState("error");
     }
-  }, [away, home, game, season, leagueAverages, variant]);
+  }, [game, leagueAverages, variant]);
 
   return (
     <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
@@ -792,6 +970,127 @@ function GameCard({
 }
 
 // ─── Main component ───────────────────────────────────────────────────────────
+
+export function BacktestModal({
+  open,
+  status,
+  result,
+  errorMsg,
+  onClose,
+}: {
+  open: boolean;
+  status: BacktestStatus;
+  result: BacktestResult | null;
+  errorMsg: string;
+  onClose: () => void;
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="w-full max-w-3xl rounded-xl border border-gray-200 bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-gray-100 px-5 py-3">
+          <div>
+            <h2 className="text-base font-medium text-gray-800">Back tast</h2>
+            <p className="text-xs text-gray-400">
+              Last 7 days, only picks above 60%
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="px-5 py-4">
+          {status === "loading" && (
+            <p className="py-10 text-center text-sm text-gray-400">
+              Back tast szamitas...
+            </p>
+          )}
+
+          {status === "error" && (
+            <p className="py-10 text-center text-sm text-red-500">
+              Hiba: {errorMsg}
+            </p>
+          )}
+
+          {status === "done" && result && (
+            <>
+              <div className="mb-3 flex flex-wrap gap-2">
+                <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-400">
+                  Datum:{" "}
+                  <span className="font-medium text-gray-700">
+                    {result.startDate} - {result.endDate}
+                  </span>
+                </div>
+                <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-400">
+                  Befejezett meccsek:{" "}
+                  <span className="font-medium text-gray-700">
+                    {result.totalFinalGames}
+                  </span>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto rounded-lg border border-gray-200">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-gray-50 text-xs uppercase tracking-wide text-gray-400">
+                    <tr>
+                      <th className="px-3 py-2 font-medium">Statisztika</th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        60%+ db
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Nyert
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Nem jott be
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Talalat
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {result.rows.map((row) => {
+                      const hitRate =
+                        row.picked > 0
+                          ? `${Math.round((row.won / row.picked) * 100)}%`
+                          : "-";
+
+                      return (
+                        <tr key={row.label}>
+                          <td className="px-3 py-2 font-medium text-gray-700">
+                            {row.label}
+                          </td>
+                          <td className="px-3 py-2 text-right text-gray-600">
+                            {row.picked}
+                          </td>
+                          <td className="px-3 py-2 text-right text-green-700">
+                            {row.won}
+                          </td>
+                          <td className="px-3 py-2 text-right text-red-700">
+                            {row.lost}
+                          </td>
+                          <td className="px-3 py-2 text-right text-gray-600">
+                            {hitRate}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export default function MLBMatchPredictor({
   variant = "basic",
@@ -881,7 +1180,8 @@ export default function MLBMatchPredictor({
         <p className="mt-1 text-xs text-gray-400">{model.note}</p>
       </div>
       {/* Date navigation */}
-      <div className="flex items-center gap-2 mb-5 flex-wrap">
+      <div className="mb-5 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 flex-wrap">
         <input
           type="date"
           value={formatDate(currentDate)}
@@ -897,6 +1197,7 @@ export default function MLBMatchPredictor({
         <button className={navBtnClass} onClick={() => loadGames(currentDate)}>
           ↻ Frissít
         </button>
+        </div>
       </div>
 
       {/* Summary chips */}
